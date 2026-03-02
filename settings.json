@@ -1,0 +1,40 @@
+{
+  "global_settings": {
+    "profit_target_pct": 0.02,
+    "stop_loss_pct": 0.01,
+    "max_daily_loss_usd": 500,
+    "max_hold_minutes": 60
+  },
+  "strategies": [
+    {
+      "name": "Scalper_EMA2",
+      "parameters": {
+        "short_span": 9,
+        "long_span": 21,
+        "period_type": "day",
+        "period": 2,
+        "frequency_type": "minute",
+        "frequency": 1
+      },
+      "symbols": [
+        { "name": "AAPL", "position_size": 100 },
+        { "name": "MSFT", "position_size": 200 },
+        { "name": "TSLA", "position_size": 300 }
+      ]
+    },
+    {
+      "name": "Scalper_EMA3",
+      "parameters": {
+        "short_span": 5,
+        "medium_span": 13,
+        "long_span": 50,
+        "frequency": 1
+      },
+      "symbols": [
+        { "name": "QQQ",  "position_size": 100 },
+        { "name": "AMZN", "position_size": 100 },
+        { "name": "NVDA", "position_size": 100 }
+      ]
+    }
+  ]
+}

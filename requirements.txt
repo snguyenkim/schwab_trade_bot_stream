@@ -1,0 +1,8 @@
+schwab-trader>=1.0.1
+pandas
+numpy
+ta
+python-dotenv
+loguru
+schedule
+tabulate
