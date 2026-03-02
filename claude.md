@@ -73,7 +73,7 @@ end_of_day_cleanup()
 
 ### Key Agent Constraints
 - **PDT Rule**: Track day trades; halt if approaching 3 day-trades in 5 days (for accounts < $25k).
-- **Market Hours**: Only trade between 09:30–16:00 ET (configurable for pre/post market).
+- **Market Hours**: Only trade between 10:00–16:00 ET. All positions flattened at 15:30 ET.
 - **Kill Switch**: Immediately flatten all positions and halt on critical error or drawdown breach.
 
 ---
@@ -127,8 +127,8 @@ day-trading-bot/
 │   └── portfolio_tracker.py   # Real-time P&L and position state
 ├── utils/
 │   └── logger.py              # Loguru setup
-└── examples/
-    └── account_overview.py    # Copied from schwab-trader for reference
+└── cresential/
+    └── credential_manager.py  # Copied from schwab-trader for reference
 ```
 
 ### Schwab API Key Endpoints (via schwab-trader)
@@ -143,7 +143,7 @@ day-trading-bot/
 
 ### Credential Storage — SQLite via `CredentialManager`
 Credentials and OAuth tokens are stored in a **SQLite database** (`schwab_trader.db`)
-using `examples/credential_manager.py` from the `schwab-trader` library.
+using `cresential/credential_manager.py` from the `schwab-trader` library.
 **Do NOT use a `.env` file** for tokens — tokens rotate every 30 minutes and only
 SQLite can persist the refreshed values automatically.
 
@@ -154,7 +154,7 @@ SQLite can persist the refreshed values automatically.
 
 #### One-time setup — save your credentials
 ```python
-from examples.credential_manager import CredentialManager
+from cresential.credential_manager import CredentialManager
 
 cm = CredentialManager()          # creates schwab_trader.db if not exists
 
@@ -171,7 +171,7 @@ cm.save_all_credentials(
 
 #### Load credentials + tokens at runtime
 ```python
-from examples.credential_manager import CredentialManager
+from cresential.credential_manager import CredentialManager
 
 cm = CredentialManager()
 
@@ -214,12 +214,9 @@ cm.save_tokens(
 git clone https://github.com/ibouazizi/schwab-trader
 pip install -e schwab-trader
 
-# 2. Copy and run the account overview example to verify auth
-python examples/account_overview.py
-
-# 3. Save credentials to SQLite (one-time only)
+# 2. Save credentials to SQLite (one-time only)
 python - << 'PYEOF'
-from examples.credential_manager import CredentialManager
+from cresential.credential_manager import CredentialManager
 cm = CredentialManager()
 cm.save_all_credentials(
     trading_client_id="YOUR_CLIENT_ID",
@@ -375,7 +372,7 @@ schwab_trader.db
 ### `auth/schwab_auth.py` — wrapper around CredentialManager
 ```python
 from pathlib import Path
-from examples.credential_manager import CredentialManager
+from cresential.credential_manager import CredentialManager
 from schwab import SchwabClient
 from loguru import logger
 
@@ -428,7 +425,7 @@ def refresh_and_save(cm: CredentialManager, new_access: str,
 Run once before first bot launch to store your Schwab API credentials.
 Usage: python scripts/setup_credentials.py
 """
-from examples.credential_manager import CredentialManager
+from cresential.credential_manager import CredentialManager
 
 cm = CredentialManager()
 
@@ -474,7 +471,7 @@ day-trading-bot/
 │   └── setup_credentials.py  # ← one-time credential setup CLI
 ├── auth/
 │   └── schwab_auth.py        # ← get_client() + refresh_and_save()
-└── examples/
+└── cresential/
     └── credential_manager.py # ← copied from schwab-trader repo
 ```
 
@@ -660,7 +657,7 @@ from config.settings_loader import load_settings
 from strategy.ema_crossover import EMACrossoverStrategy
 
 # Load credentials from SQLite
-from examples.credential_manager import CredentialManager
+from cresential.credential_manager import CredentialManager
 cm = CredentialManager()
 if not cm.has_valid_auth():
     raise RuntimeError("No valid auth — run credential setup first")
@@ -945,7 +942,7 @@ ENTRY → [monitor loop] → STOP-LOSS exit
                        → PROFIT-TARGET exit
                        → TRAILING-STOP exit
                        → TIME-STOP exit (max hold)
-                       → EOD FLATTEN (15:45 ET)
+                       → EOD FLATTEN (15:30 ET)
                        → KILL SWITCH (daily loss breach)
 ```
 
@@ -1001,7 +998,7 @@ from utils.trade_logger import (
 )
 
 ET = ZoneInfo("America/New_York")
-EOD_FLATTEN_TIME = dt_time(15, 45)   # force-close all by 15:45 ET
+EOD_FLATTEN_TIME = dt_time(15, 30)   # force-close all by 15:30 ET
 
 
 class PositionMonitor:
@@ -1230,8 +1227,8 @@ while market_is_open():
 09:31:10 | WARNING  | position_monitor - [MONITOR] EXIT TRIGGERED | TQQQ | reason=stop-loss hit (-1.03% <= -1.00%)
 09:31:10 | INFO     | portfolio        - [POSITION] CLOSED   | TQQQ qty=5 entry=82.3500 exit=81.5000 pnl=-4.25 (-1.03%)
 09:45:17 | INFO     | portfolio        - [POSITION] CLOSED   | AAPL qty=10 entry=182.3500 exit=185.8900 pnl=+35.40 (+1.94%)
-15:45:00 | CRITICAL | position_monitor - [MONITOR] FLATTEN ALL | reason=EOD flatten — market close approaching
-15:45:01 | INFO     | portfolio        - [POSITION] CLOSED   | AMZN qty=3 entry=670.1000 exit=672.5000 pnl=+7.20 (+0.36%)
+15:30:00 | CRITICAL | position_monitor - [MONITOR] FLATTEN ALL | reason=EOD flatten — market close approaching
+15:30:01 | INFO     | portfolio        - [POSITION] CLOSED   | AMZN qty=3 entry=670.1000 exit=672.5000 pnl=+7.20 (+0.36%)
 
 # File (TRACE — every 5s tick)
 2025-03-02 09:31:10.042 | DEBUG | position_monitor:_check_all_positions:91 - [MONITOR] TQQQ | price=81.5000 | pnl=-4.25 (-1.03%) | peak=82.6100
@@ -1247,7 +1244,7 @@ while market_is_open():
 | Profit target | `pnl_pct >= profit_target_pct` | `settings.json` |
 | Trailing stop | drawdown from peak `<= -trailing_stop_pct` | `settings.json` |
 | Time-stop | held `>= max_hold_minutes` | `settings.json` |
-| EOD flatten | current ET time `>= 15:45` | hardcoded (safe default) |
+| EOD flatten | current ET time `>= 15:30` | hardcoded (safe default) |
 | Kill switch | `realized_pnl <= -max_daily_loss_usd` | `settings.json` |
 
 ---
@@ -1261,3 +1258,32 @@ day-trading-bot/
 │   └── portfolio_tracker.py   # ← Aggregate P&L and position state
 └── ...
 ```
+
+---
+
+## 📝 Implementation Changes (vs. Template)
+
+The following changes were made during Phase 1 implementation:
+
+### Folder rename
+- `examples/` renamed to `cresential/` — contains `credential_manager.py`
+- All `sys.path.insert` references updated in `auth/schwab_auth.py` and `scripts/setup_credentials.py`
+
+### Trading hours
+| Setting | Template | Actual |
+|---------|----------|--------|
+| Market open | 09:30 ET | **10:00 ET** (`main.py`) |
+| EOD flatten | 15:45 ET | **15:30 ET** (`portfolio/position_monitor.py`) |
+
+### Paper trading mode
+`execution/order_manager.py` runs in paper trading mode — **no real orders are submitted**.
+All BUY/SELL signals are logged with a `PAPER-` prefixed order ID and the current quote price.
+Set `OrderManager.PAPER_TRADING = False` to re-enable live order submission.
+
+### Bug fix — CredentialManager
+`cresential/credential_manager.py` `get_credentials()` was patched to use
+`sqlite3.Row` column-name access instead of hardcoded positional indices,
+which caused `None` to be returned on freshly created databases.
+
+### GitHub repository
+[github.com/snguyenkim/schwab_trade_bot](https://github.com/snguyenkim/schwab_trade_bot) (private)
