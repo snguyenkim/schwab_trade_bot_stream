@@ -3,8 +3,8 @@ from pathlib import Path
 from datetime import datetime
 from loguru import logger
 
-# Allow importing credential_manager from the examples/ directory
-sys.path.insert(0, str(Path(__file__).parent.parent / "examples"))
+# Allow importing credential_manager from the cresential/ directory
+sys.path.insert(0, str(Path(__file__).parent.parent / "cresential"))
 from credential_manager import CredentialManager
 
 from schwab import SchwabClient, SchwabAuth

@@ -13,7 +13,7 @@ import webbrowser
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "examples"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "cresential"))
 from credential_manager import CredentialManager
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
