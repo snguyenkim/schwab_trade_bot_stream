@@ -29,7 +29,7 @@ from execution.order_manager import OrderManager
 from portfolio.position_monitor import PositionMonitor
 
 ET = ZoneInfo("America/New_York")
-MARKET_OPEN = dt_time(9, 30)
+MARKET_OPEN = dt_time(10, 0)
 MARKET_CLOSE = dt_time(16, 0)
 STRATEGY_NAME = "Scalper_EMA2"
 

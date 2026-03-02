@@ -12,7 +12,7 @@ from utils.trade_logger import (
 )
 
 ET = ZoneInfo("America/New_York")
-EOD_FLATTEN_TIME = dt_time(15, 45)
+EOD_FLATTEN_TIME = dt_time(15, 30)
 
 
 class PositionMonitor:
