@@ -1,6 +1,10 @@
 """
 backtest/report.py — Performance statistics and trade-log printer.
 
+Adapts automatically to the backtest mode stored in BacktestResult:
+  "daily"    — hold time shown in days,   dates as YYYY-MM-DD
+  "intraday" — hold time shown in minutes, dates as YYYY-MM-DD HH:MM
+
 Metrics computed:
   - Total P&L ($)
   - Win rate (%)
@@ -15,7 +19,7 @@ Metrics computed:
 from __future__ import annotations
 
 import math
-from backtest.engine import BacktestResult, Trade
+from backtest.engine import BacktestResult, Trade, MODES
 
 
 # ── Stat helpers ──────────────────────────────────────────────────────────────
@@ -30,7 +34,6 @@ def _sharpe(returns: list[float], risk_free: float = 0.0) -> float:
     std  = math.sqrt(var) if var > 0 else 0.0
     if std == 0:
         return 0.0
-    # Annualise using sqrt(252) — standard assumption for daily returns
     return (mean - risk_free) / std * math.sqrt(252)
 
 
@@ -52,18 +55,25 @@ def _max_drawdown(equity_curve: list[float]) -> float:
 def print_report(symbol: str, result: BacktestResult) -> dict:
     """
     Print a formatted report for one symbol and return a stats dict.
+    Automatically adjusts date format and hold-time unit based on result.mode.
     Returns {} if no trades were generated.
     """
-    trades = result.trades
-    n      = len(trades)
+    trades    = result.trades
+    n         = len(trades)
+    intraday  = (result.mode == "intraday")
+    date_fmt  = MODES[result.mode]["date_fmt"]
+    mode_label = MODES[result.mode]["label"]
 
-    print(f"\n{'=' * 62}")
-    print(f"  BACKTEST REPORT — {symbol}  ({result.n_bars} daily bars, 1 year)")
-    print(f"{'=' * 62}")
+    # Column widths differ: intraday dates are 16 chars, daily are 10
+    date_w = 16 if intraday else 12
+
+    print(f"\n{'=' * 68}")
+    print(f"  BACKTEST REPORT — {symbol}  ({result.n_bars} bars, {mode_label})")
+    print(f"{'=' * 68}")
 
     if n == 0:
         print("  No trades generated — insufficient signal or data.")
-        print(f"{'=' * 62}")
+        print(f"{'=' * 68}")
         return {}
 
     wins   = [t for t in trades if t.pnl > 0]
@@ -78,7 +88,15 @@ def print_report(symbol: str, result: BacktestResult) -> dict:
     profit_factor = gross_wins / gross_losses if gross_losses > 0 else float("inf")
     sharpe        = _sharpe([t.pnl_pct for t in trades])
     max_dd        = _max_drawdown(result.equity_curve)
-    avg_hold      = sum(t.hold_days for t in trades) / n
+
+    if intraday:
+        avg_hold     = sum(t.hold_mins for t in trades) / n
+        hold_label   = f"{avg_hold:.0f} min"
+        hold_key     = "avg_hold_mins"
+    else:
+        avg_hold     = sum(t.hold_days for t in trades) / n
+        hold_label   = f"{avg_hold:.1f} days"
+        hold_key     = "avg_hold_days"
 
     exit_counts: dict[str, int] = {}
     for t in trades:
@@ -92,36 +110,42 @@ def print_report(symbol: str, result: BacktestResult) -> dict:
     print(f"  Profit factor   : {profit_factor:.2f}")
     print(f"  Sharpe ratio    : {sharpe:.2f}  (annualised)")
     print(f"  Max drawdown    : ${max_dd:>,.2f}")
-    print(f"  Avg hold (days) : {avg_hold:.1f}")
+    print(f"  Avg hold        : {hold_label}")
     print(f"  Exit breakdown  : {exit_counts}")
-    print(f"{'─' * 62}")
+    print(f"{'─' * 68}")
 
-    # Trade log
-    hdr = f"  {'Entry date':<12} {'Exit date':<12} {'Entry':>8} {'Exit':>8} {'P&L':>10}  Reason"
-    print(hdr)
-    print(f"  {'─' * 58}")
+    # Trade log header
+    hold_hdr = "Hold(m)" if intraday else "Hold(d)"
+    print(
+        f"  {'Entry':>{date_w}} {'Exit':>{date_w}} "
+        f"{'Entry':>8} {'Exit':>8} {'P&L':>10}  {hold_hdr:<8} Reason"
+    )
+    print(f"  {'─' * 64}")
+
     for t in trades:
-        entry_d = t.entry_date.strftime("%Y-%m-%d") if t.entry_date else "?"
-        exit_d  = t.exit_date.strftime("%Y-%m-%d")  if t.exit_date  else "?"
+        entry_d  = t.entry_date.strftime(date_fmt) if t.entry_date else "?"
+        exit_d   = t.exit_date.strftime(date_fmt)  if t.exit_date  else "?"
+        hold_val = f"{t.hold_mins:.0f}" if intraday else f"{t.hold_days}"
         print(
-            f"  {entry_d:<12} {exit_d:<12} "
+            f"  {entry_d:>{date_w}} {exit_d:>{date_w}} "
             f"{t.entry_price:>8.4f} {t.exit_price:>8.4f} "
-            f"${t.pnl:>+9.2f}  {t.exit_reason}"
+            f"${t.pnl:>+9.2f}  {hold_val:<8} {t.exit_reason}"
         )
 
-    print(f"{'=' * 62}")
+    print(f"{'=' * 68}")
 
     return {
-        "symbol":         symbol,
-        "n_trades":       n,
-        "win_rate_pct":   round(win_rate, 2),
-        "total_pnl":      round(total_pnl, 2),
-        "avg_win":        round(avg_win, 2),
-        "avg_loss":       round(avg_loss, 2),
-        "profit_factor":  round(profit_factor, 4),
-        "sharpe":         round(sharpe, 4),
-        "max_drawdown":   round(max_dd, 2),
-        "avg_hold_days":  round(avg_hold, 1),
+        "symbol":        symbol,
+        "mode":          result.mode,
+        "n_trades":      n,
+        "win_rate_pct":  round(win_rate, 2),
+        "total_pnl":     round(total_pnl, 2),
+        "avg_win":       round(avg_win, 2),
+        "avg_loss":      round(avg_loss, 2),
+        "profit_factor": round(profit_factor, 4),
+        "sharpe":        round(sharpe, 4),
+        "max_drawdown":  round(max_dd, 2),
+        hold_key:        round(avg_hold, 1),
         "exit_breakdown": exit_counts,
     }
 

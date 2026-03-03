@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-scripts/run_backtest.py — Run a strategy backtest against 1 year of Schwab daily data.
+scripts/run_backtest.py — Run a strategy backtest against Schwab historical data.
+
+Modes:
+  --mode daily     (default) 1 year  of daily bars     — ~252 candles/symbol
+  --mode intraday             10 days of 1-minute bars  — ~3,900 candles/symbol
 
 Usage:
-    # Use whatever strategy is set in settings.json
     python scripts/run_backtest.py
-
-    # Override strategy explicitly
-    python scripts/run_backtest.py --strategy Scalper_EMA2
-    python scripts/run_backtest.py --strategy Scalper_EMA3
+    python scripts/run_backtest.py --strategy Scalper_EMA2 --mode daily
+    python scripts/run_backtest.py --strategy Scalper_EMA3 --mode intraday
 """
 
 import argparse
@@ -22,7 +23,7 @@ from auth.schwab_auth import get_client
 from config.settings_loader import load_settings
 from strategy.ema_crossover import EMACrossoverStrategy
 from strategy.ema3_crossover import EMA3CrossoverStrategy
-from backtest.engine import BacktestEngine
+from backtest.engine import BacktestEngine, MODES
 from backtest.report import print_report, print_summary
 
 STRATEGY_CLASSES = {
@@ -33,14 +34,21 @@ STRATEGY_CLASSES = {
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Backtest a strategy against 1 year of Schwab daily price history."
+        description="Backtest a strategy against Schwab price history."
     )
     parser.add_argument(
         "--strategy", default=None,
         help=(
-            "Strategy name to backtest. "
-            "Choices: Scalper_EMA2, Scalper_EMA3. "
-            "Defaults to the strategy set in settings.json global_settings.strategy."
+            "Strategy to backtest: Scalper_EMA2 or Scalper_EMA3. "
+            "Defaults to the strategy set in settings.json."
+        ),
+    )
+    parser.add_argument(
+        "--mode", default="daily", choices=list(MODES),
+        help=(
+            "Data mode: "
+            "'daily' = 1 year of daily bars (default); "
+            "'intraday' = 10 days of 1-minute bars."
         ),
     )
     args = parser.parse_args()
@@ -56,7 +64,7 @@ def main() -> None:
         )
         sys.exit(1)
 
-    setup_logger(log_dir="logs", strategy_name=f"backtest_{strategy_name}")
+    setup_logger(log_dir="logs", strategy_name=f"backtest_{strategy_name}_{args.mode}")
 
     # ── Auth ────────────────────────────────────────────────────────────────
     print(f"\nAuthenticating with Schwab API...")
@@ -79,13 +87,13 @@ def main() -> None:
 
     print(f"\n  Strategy : {strategy_name}  (EMA {spans})")
     print(f"  Symbols  : {list(strategy.symbols.keys())}")
-    print(f"  Data     : 1 year of daily bars from Schwab API")
+    print(f"  Mode     : {args.mode}  —  {MODES[args.mode]['label']}")
     print(f"  Risk     : stop={settings.global_settings.stop_loss_pct:.1%}  "
           f"target={settings.global_settings.profit_target_pct:.1%}")
     print()
 
     # ── Run backtest ────────────────────────────────────────────────────────
-    engine  = BacktestEngine(client, strategy, settings_path="settings.json")
+    engine  = BacktestEngine(client, strategy, settings_path="settings.json", mode=args.mode)
     results = engine.run()
 
     # ── Report ──────────────────────────────────────────────────────────────

@@ -1,9 +1,14 @@
 """
 backtest/engine.py — Walk-forward backtesting engine.
 
-Data source : Schwab API get_price_history()
-              period_type="year", period=1, frequency_type="daily", frequency=1
-              → ~252 daily OHLCV candles per symbol.
+Two modes:
+
+  "daily"    — 1 year of daily OHLCV bars (~252 candles per symbol)
+               period_type="year", period=1, frequency_type="daily", frequency=1
+
+  "intraday" — 10 days of 1-minute OHLCV bars (~3,900 candles per symbol)
+               period_type="day", period=10, frequency_type="minute", frequency=1
+               (Schwab API maximum for intraday data)
 
 Fill model  : BUY/SELL signals are filled at the NEXT bar's open price,
               avoiding look-ahead bias.
@@ -28,6 +33,28 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config.settings_loader import load_settings
 
 
+# ── Mode configuration ────────────────────────────────────────────────────────
+
+MODES: dict[str, dict] = {
+    "daily": {
+        "period_type":    "year",
+        "period":         1,
+        "frequency_type": "daily",
+        "frequency":      1,
+        "label":          "1 year of daily bars",
+        "date_fmt":       "%Y-%m-%d",
+    },
+    "intraday": {
+        "period_type":    "day",
+        "period":         10,
+        "frequency_type": "minute",
+        "frequency":      1,
+        "label":          "10 days of 1-minute bars",
+        "date_fmt":       "%Y-%m-%d %H:%M",
+    },
+}
+
+
 # ── Data model ────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -37,10 +64,10 @@ class Trade:
     entry_bar:   int
     entry_price: float
     entry_date:  datetime
-    exit_bar:    int           = 0
-    exit_price:  float         = 0.0
+    exit_bar:    int                = 0
+    exit_price:  float             = 0.0
     exit_date:   Optional[datetime] = None
-    exit_reason: str           = ""
+    exit_reason: str               = ""
 
     @property
     def pnl(self) -> float:
@@ -58,10 +85,17 @@ class Trade:
             return (self.exit_date - self.entry_date).days
         return 0
 
+    @property
+    def hold_mins(self) -> float:
+        if self.entry_date and self.exit_date:
+            return (self.exit_date - self.entry_date).total_seconds() / 60
+        return 0.0
+
 
 @dataclass
 class BacktestResult:
     symbol:       str
+    mode:         str         = "daily"
     trades:       list[Trade] = field(default_factory=list)
     equity_curve: list[float] = field(default_factory=list)  # cumulative P&L per bar
     n_bars:       int         = 0
@@ -71,16 +105,26 @@ class BacktestResult:
 
 class BacktestEngine:
     """
-    Replays 1 year of daily Schwab price history through a strategy.
+    Replays Schwab price history through a strategy.
 
     Usage:
-        engine  = BacktestEngine(client, strategy)
+        engine  = BacktestEngine(client, strategy, mode="intraday")
         results = engine.run()           # dict[symbol → BacktestResult]
+
+    mode:
+        "daily"    — 1 year  of daily bars   (default)
+        "intraday" — 10 days of 1-min  bars
     """
 
-    def __init__(self, client, strategy, settings_path: str = "settings.json"):
+    def __init__(self, client, strategy,
+                 settings_path: str = "settings.json",
+                 mode: str = "daily"):
+        if mode not in MODES:
+            raise ValueError(f"mode must be one of {list(MODES)}; got '{mode}'")
         self.client   = client
         self.strategy = strategy
+        self.mode     = mode
+        self._cfg     = MODES[mode]
         cfg = load_settings(settings_path).global_settings
         self.profit_target_pct = cfg.profit_target_pct   # e.g. 0.02
         self.stop_loss_pct     = cfg.stop_loss_pct       # e.g. 0.01
@@ -89,16 +133,16 @@ class BacktestEngine:
 
     def fetch_history(self, symbol: str) -> pd.DataFrame:
         """
-        Fetch 1 year of daily OHLCV candles from Schwab.
-        Returns a DataFrame with columns: date, open, high, low, close, volume.
-        Rows are sorted oldest → newest.
+        Fetch OHLCV candles from Schwab using the current mode's parameters.
+        Returns a DataFrame sorted oldest → newest with columns:
+          date, open, high, low, close, volume
         """
         raw = self.client.get_price_history(
             symbol=symbol,
-            period_type="year",
-            period=1,
-            frequency_type="daily",
-            frequency=1,
+            period_type=self._cfg["period_type"],
+            period=self._cfg["period"],
+            frequency_type=self._cfg["frequency_type"],
+            frequency=self._cfg["frequency"],
         )
         candles = raw.get("candles", [])
         if not candles:
@@ -116,11 +160,12 @@ class BacktestEngine:
             })
 
         df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+        fmt = self._cfg["date_fmt"]
         logger.info(
-            "[BACKTEST] {} — {} daily bars  ({} → {})",
-            symbol, len(df),
-            df["date"].iloc[0].strftime("%Y-%m-%d"),
-            df["date"].iloc[-1].strftime("%Y-%m-%d"),
+            "[BACKTEST] {} — {} bars  ({})  {} → {}",
+            symbol, len(df), self._cfg["label"],
+            df["date"].iloc[0].strftime(fmt),
+            df["date"].iloc[-1].strftime(fmt),
         )
         return df
 
@@ -133,10 +178,11 @@ class BacktestEngine:
         """
         df     = self.fetch_history(symbol)
         closes = df["close"]
-        result = BacktestResult(symbol=symbol, n_bars=len(df))
+        result = BacktestResult(symbol=symbol, mode=self.mode, n_bars=len(df))
 
         open_trade: Optional[Trade] = None
         cumulative_pnl = 0.0
+        fmt = self._cfg["date_fmt"]
 
         for i in range(len(df)):
             result.equity_curve.append(cumulative_pnl)
@@ -148,7 +194,7 @@ class BacktestEngine:
                 pnl_pct_high = (bar["high"] - open_trade.entry_price) / open_trade.entry_price
                 pnl_pct_low  = (bar["low"]  - open_trade.entry_price) / open_trade.entry_price
 
-                # Stop-loss — assume filled at stop price (not bar low)
+                # Stop-loss — filled at exact stop price (not bar low)
                 if pnl_pct_low <= -self.stop_loss_pct:
                     exit_price = round(open_trade.entry_price * (1 - self.stop_loss_pct), 4)
                     open_trade = self._close(
@@ -159,7 +205,7 @@ class BacktestEngine:
                     open_trade = None
                     continue
 
-                # Profit target — assume filled at target price (not bar high)
+                # Profit target — filled at exact target price (not bar high)
                 elif pnl_pct_high >= self.profit_target_pct:
                     exit_price = round(open_trade.entry_price * (1 + self.profit_target_pct), 4)
                     open_trade = self._close(
@@ -192,7 +238,7 @@ class BacktestEngine:
                 logger.debug(
                     "[BACKTEST] {} BUY  bar={} @ {:.4f}  ({})",
                     symbol, i + 1, next_open,
-                    next_date.strftime("%Y-%m-%d"),
+                    next_date.strftime(fmt),
                 )
 
             elif signal == "SELL" and open_trade is not None:
@@ -202,7 +248,7 @@ class BacktestEngine:
                 logger.debug(
                     "[BACKTEST] {} SELL bar={} @ {:.4f}  pnl={:+.2f}  ({})",
                     symbol, i + 1, next_open, open_trade.pnl,
-                    next_date.strftime("%Y-%m-%d"),
+                    next_date.strftime(fmt),
                 )
                 open_trade = None
 
@@ -231,7 +277,7 @@ class BacktestEngine:
         """
         results = {}
         for symbol, size in self.strategy.symbols.items():
-            logger.info("[BACKTEST] Starting {} (size={})", symbol, size)
+            logger.info("[BACKTEST] Starting {} (size={})  mode={}", symbol, size, self.mode)
             try:
                 results[symbol] = self.run_symbol(symbol, size)
             except Exception as exc:
