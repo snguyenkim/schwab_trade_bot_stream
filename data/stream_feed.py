@@ -30,13 +30,70 @@ EOD_FLATTEN_TIME = dt_time(15, 30)
 
 class SSLSchwabStreamer(SchwabStreamer):
     """
-    SchwabStreamer with a certifi SSL context.
+    SchwabStreamer with two fixes:
 
-    The base library calls ``websockets.connect(url)`` without an SSL context,
-    which fails on macOS Python 3.14 when the server chain contains a
-    self-signed intermediate certificate.  This subclass overrides ``connect()``
-    to inject ``ssl=certifi_ctx`` so the handshake succeeds.
+    1. SSL — passes a certifi CA bundle to websockets.connect() so the TLS
+       handshake succeeds on macOS Python 3.14.
+
+    2. Login format — the base library uses the old TD Ameritrade "credential"
+       JSON-blob format.  Schwab's current API expects:
+           SchwabClientCustomerId / SchwabClientCorrelId at the top level
+           Authorization: <access_token> in parameters
+       Without the correct format the server silently accepts the connection
+       but never sends any market data.
+
+    3. Login-before-subscribe — connect() now waits up to 10 s for the server
+       to confirm LOGIN before returning, so subscriptions are never sent to
+       an unauthenticated session.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._login_event = asyncio.Event()
+
+    # ── Correct Schwab streaming login ────────────────────────────────────────
+
+    async def _login(self) -> None:
+        login_request = {
+            "requests": [{
+                "service": "ADMIN",
+                "command": "LOGIN",
+                "requestid": "1",
+                "SchwabClientCustomerId": self.streamer_info.schwab_client_customer_id,
+                "SchwabClientCorrelId":   self.streamer_info.schwab_client_correl_id,
+                "parameters": {
+                    "Authorization":          self.auth.access_token,
+                    "SchwabClientChannel":    self.streamer_info.schwab_client_channel,
+                    "SchwabClientFunctionId": self.streamer_info.schwab_client_function_id,
+                },
+            }]
+        }
+        await self._send_request(login_request)
+
+    # ── Log every server response and signal login success ────────────────────
+
+    async def _handle_response(self, responses: list) -> None:
+        for response in responses:
+            service = response.get("service", "")
+            command = response.get("command", "")
+            content = response.get("content", {})
+            code    = content.get("code", -1) if isinstance(content, dict) else -1
+            msg     = content.get("msg",  "") if isinstance(content, dict) else ""
+            logger.info(
+                "[STREAM] Server response: service={} command={} code={} msg={}",
+                service, command, code, msg,
+            )
+            if service == "ADMIN" and command == "LOGIN":
+                if code == 0:
+                    logger.info("[STREAM] Login confirmed — ready to receive data")
+                    self._login_event.set()
+                else:
+                    logger.error(
+                        "[STREAM] Login FAILED — no data will arrive | code={} msg={}",
+                        code, msg,
+                    )
+
+    # ── SSL connect + wait for login confirmation ─────────────────────────────
 
     async def connect(self) -> None:
         if self.is_connected:
@@ -45,9 +102,15 @@ class SSLSchwabStreamer(SchwabStreamer):
         self.websocket = await websockets.connect(
             self.streamer_info.streamer_socket_url, ssl=ssl_ctx
         )
-        await self._login()
+        # Start receiving BEFORE sending login so the response is captured
+        self._receive_task  = asyncio.create_task(self._receive_loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        self._receive_task = asyncio.create_task(self._receive_loop())
+        await self._login()
+        # Block until the server confirms LOGIN (or timeout after 10 s)
+        try:
+            await asyncio.wait_for(self._login_event.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning("[STREAM] Login confirmation timed out — proceeding anyway")
         self.is_connected = True
 
 
