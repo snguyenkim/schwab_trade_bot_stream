@@ -93,6 +93,30 @@ class SSLSchwabStreamer(SchwabStreamer):
                         code, msg,
                     )
 
+    # ── Outgoing request normaliser ───────────────────────────────────────────
+
+    async def _send_request(self, request: dict) -> None:
+        """
+        Normalise every outgoing request to Schwab's current API format,
+        then forward to the base send.
+
+        The base library was written for the old TD Ameritrade format.
+        Two transformations are needed for all subscription / admin requests:
+          1. "account" → "SchwabClientCustomerId"
+             "source"  → "SchwabClientCorrelId"
+          2. QOS command: "service":"QOS" → "service":"ADMIN"
+             (Schwab requires all ADMIN commands to carry service="ADMIN")
+        """
+        for req in request.get("requests", []):
+            if "account" in req:
+                req["SchwabClientCustomerId"] = req.pop("account")
+            if "source" in req:
+                req["SchwabClientCorrelId"] = req.pop("source")
+            if req.get("service") == "QOS":
+                req["service"] = "ADMIN"
+        logger.info("[STREAM] SEND → {}", str(request)[:400])
+        await super()._send_request(request)
+
     # ── Raw message logger (overrides silent base implementation) ────────────
 
     async def _receive_loop(self) -> None:
