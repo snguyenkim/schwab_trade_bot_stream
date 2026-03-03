@@ -64,20 +64,22 @@ class MarketData:
     def get_latest_price(self, symbol: str) -> float:
         """Fetch the latest trade price for a single symbol via quotes endpoint."""
         try:
-            quote = self.client.get_quote(symbol)
-            # The quote response shape varies; try common field names
-            price = (
-                quote.get("lastPrice")
-                or quote.get("last")
-                or quote.get("mark")
-            )
+            response = self.client.get_quotes(symbol)
+            obj = response.root.get(symbol)
+            if obj is None:
+                raise ValueError(f"No quote data returned for {symbol}")
+            inner = obj.root
+            quote = getattr(inner, "quote", None)
+            if quote is None:
+                raise ValueError(f"Quote field missing for {symbol}")
+            price = (getattr(quote, "last_price", None)
+                     or getattr(quote, "mark", None)
+                     or getattr(quote, "ask_price", None))
             if price is None:
-                # Some responses nest under the symbol key
-                inner = quote.get(symbol, {})
-                price = inner.get("lastPrice") or inner.get("last") or inner.get("mark")
+                raise ValueError(f"All price fields None for {symbol}")
             return float(price)
         except Exception as exc:
-            logger.error("[DATA] get_quote failed | {symbol} | {exc}",
+            logger.error("[DATA] get_latest_price failed | {symbol} | {exc}",
                          symbol=symbol, exc=exc)
             raise
 

@@ -164,15 +164,19 @@ class PositionMonitor:
             self._close_position(pos, price, reason)
 
     def _get_price(self, symbol: str) -> float:
-        quote = self.client.get_quote(symbol)
-        # Handle both nested and flat quote shapes
-        if symbol in quote:
-            inner = quote[symbol]
-            price = (inner.get("lastPrice") or inner.get("last")
-                     or inner.get("mark") or inner.get("bidPrice"))
-        else:
-            price = (quote.get("lastPrice") or quote.get("last")
-                     or quote.get("mark"))
+        response = self.client.get_quotes(symbol)
+        obj = response.root.get(symbol)
+        if obj is None:
+            raise ValueError(f"No quote data returned for {symbol}")
+        inner = obj.root
+        quote = getattr(inner, "quote", None)
+        if quote is None:
+            raise ValueError(f"Quote field missing for {symbol}")
+        price = (getattr(quote, "last_price", None)
+                 or getattr(quote, "mark", None)
+                 or getattr(quote, "ask_price", None))
+        if price is None:
+            raise ValueError(f"All price fields None for {symbol}")
         return float(price)
 
     def _save_state(self) -> None:

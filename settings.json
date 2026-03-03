@@ -2,9 +2,9 @@
   "global_settings": {
     "strategy": "Scalper_EMA2",
     "profit_target_pct": 0.02,
-    "stop_loss_pct": 0.01,
+    "stop_loss_pct": 0.015,
     "max_daily_loss_usd": 500,
-    "max_hold_minutes": 60
+    "max_hold_minutes": 90
   },
   "strategies": [
     {
@@ -15,7 +15,7 @@
         "period_type": "day",
         "period": 2,
         "frequency_type": "minute",
-        "frequency": 1
+        "frequency": 5
       },
       "symbols": [
         { "name": "AAPL", "position_size": 100 },
@@ -32,7 +32,7 @@
         "period_type": "day",
         "period": 2,
         "frequency_type": "minute",
-        "frequency": 1
+        "frequency": 5
       },
       "symbols": [
         { "name": "QQQ",  "position_size": 100 },

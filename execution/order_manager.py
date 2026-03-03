@@ -187,13 +187,23 @@ class OrderManager:
 
     def _fetch_price(self, symbol: str) -> float:
         try:
-            quote = self.client.get_quote(symbol)
-            if symbol in quote:
-                inner = quote[symbol]
-                price = (inner.get("lastPrice") or inner.get("last")
-                         or inner.get("mark") or inner.get("askPrice"))
-            else:
-                price = quote.get("lastPrice") or quote.get("last") or quote.get("mark")
+            response = self.client.get_quotes(symbol)
+            obj = response.root.get(symbol)
+            if obj is None:
+                logger.warning("[ORDER] No quote data returned for {}", symbol)
+                return 0.0
+            inner = obj.root          # EquityResponse (or similar)
+            quote = getattr(inner, "quote", None)
+            if quote is None:
+                logger.warning("[ORDER] Quote field missing for {}", symbol)
+                return 0.0
+            price = (getattr(quote, "last_price", None)
+                     or getattr(quote, "mark", None)
+                     or getattr(quote, "ask_price", None))
+            if price is None:
+                logger.warning("[ORDER] All price fields None for {}", symbol)
+                return 0.0
             return float(price)
-        except Exception:
+        except Exception as exc:
+            logger.error("[ORDER] _fetch_price failed for {}: {}", symbol, exc)
             return 0.0
