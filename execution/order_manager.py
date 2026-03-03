@@ -8,6 +8,7 @@ from utils.trade_logger import (
     log_order_submitted, log_order_filled,
     log_order_rejected, log_order_cancelled,
 )
+from utils.trading_log import TradingLog
 
 # Schwab order model imports
 from schwab.models.generated.trading_models import (
@@ -46,16 +47,18 @@ class OrderManager:
 
     PAPER_TRADING = True  # Set to False to enable live order submission
 
-    def __init__(self, client, account_hash: str):
+    def __init__(self, client, account_hash: str, trading_log: TradingLog | None = None):
         """
         Args:
             client: authenticated SchwabClient instance
             account_hash: encrypted account hash from get_account_numbers()
+            trading_log: optional TradingLog instance for daily CSV recording
         """
         self.client = client
         self.account_hash = account_hash
         self._entry_prices: dict[str, float] = {}   # symbol → entry fill price
         self._order_counter: int = 0
+        self._trading_log = trading_log
 
     def execute(self, symbol: str, side: str, quantity: int) -> float:
         """
@@ -85,6 +88,9 @@ class OrderManager:
             self._entry_prices[symbol] = fill_price
         else:
             self._entry_prices.pop(symbol, None)
+
+        if self._trading_log:
+            self._trading_log.record(symbol, side.upper(), quantity, fill_price)
 
         return fill_price
 

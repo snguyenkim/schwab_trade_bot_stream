@@ -28,6 +28,7 @@ PID_FILE = Path("bot.pid")
 # ── Project imports ─────────────────────────────────────────────────────────
 from utils.logger import setup_logger
 from utils.trade_logger import log_kill_switch
+from utils.trading_log import TradingLog
 from auth.schwab_auth import get_client
 from config.settings_loader import load_settings
 from data.market_data import MarketData
@@ -111,9 +112,10 @@ async def run_bot() -> None:
     )
 
     # ── Sub-components ─────────────────────────────────────────────────────────
-    market_data  = MarketData(client)
-    risk_manager = RiskManager(settings_path="settings.json")
-    order_manager = OrderManager(client, account_hash)
+    market_data   = MarketData(client)
+    risk_manager  = RiskManager(settings_path="settings.json")
+    trading_log   = TradingLog(strategy_name=strategy_name, log_dir="logs")
+    order_manager = OrderManager(client, account_hash, trading_log=trading_log)
     monitor = PositionMonitor(client, order_manager, settings_path="settings.json")
 
     # ── Streamer setup ─────────────────────────────────────────────────────────
@@ -185,6 +187,7 @@ async def run_bot() -> None:
         "[MAIN] Session complete | realized_pnl={pnl:+.2f}",
         pnl=risk_manager.daily_pnl,
     )
+    trading_log.print_summary()
 
 
 def main() -> None:
