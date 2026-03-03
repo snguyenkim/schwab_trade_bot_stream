@@ -1,14 +1,19 @@
 """
 backtest/engine.py — Walk-forward backtesting engine.
 
-Two modes:
+Two data modes (--mode):
 
-  "daily"    — 1 year of daily OHLCV bars (~252 candles per symbol)
+  "daily"    — 1 year  of daily bars  (~252 candles/symbol)
                period_type="year", period=1, frequency_type="daily", frequency=1
 
-  "intraday" — 10 days of 1-minute OHLCV bars (~3,900 candles per symbol)
-               period_type="day", period=10, frequency_type="minute", frequency=1
-               (Schwab API maximum for intraday data)
+  "intraday" — 10 days of 1-min bars  (~3,900 candles/symbol)
+               period_type="day",  period=10, frequency_type="minute", frequency=1
+
+Custom date range (--start / --end, format YYYY-MM-DD):
+  When both dates are provided the period param is replaced by start_date/end_date
+  (milliseconds since epoch). The mode still controls the bar frequency:
+    --mode daily    → daily   bars for the given range
+    --mode intraday → 1-minute bars for the given range (max ~10 days of minute data)
 
 Fill model  : BUY/SELL signals are filled at the NEXT bar's open price,
               avoiding look-ahead bias.
@@ -54,6 +59,14 @@ MODES: dict[str, dict] = {
     },
 }
 
+_DATE_INPUT_FMT = "%Y-%m-%d"
+
+
+def _to_epoch_ms(date_str: str) -> int:
+    """Convert 'YYYY-MM-DD' string to milliseconds since epoch (Schwab API format)."""
+    dt = datetime.strptime(date_str, _DATE_INPUT_FMT)
+    return int(dt.timestamp() * 1000)
+
 
 # ── Data model ────────────────────────────────────────────────────────────────
 
@@ -96,8 +109,9 @@ class Trade:
 class BacktestResult:
     symbol:       str
     mode:         str         = "daily"
+    date_range:   str         = ""        # e.g. "2025-01-01 → 2025-12-31" or ""
     trades:       list[Trade] = field(default_factory=list)
-    equity_curve: list[float] = field(default_factory=list)  # cumulative P&L per bar
+    equity_curve: list[float] = field(default_factory=list)
     n_bars:       int         = 0
 
 
@@ -108,42 +122,67 @@ class BacktestEngine:
     Replays Schwab price history through a strategy.
 
     Usage:
-        engine  = BacktestEngine(client, strategy, mode="intraday")
-        results = engine.run()           # dict[symbol → BacktestResult]
+        # Standard modes
+        engine = BacktestEngine(client, strategy, mode="daily")
+        engine = BacktestEngine(client, strategy, mode="intraday")
 
-    mode:
-        "daily"    — 1 year  of daily bars   (default)
-        "intraday" — 10 days of 1-min  bars
+        # Custom date range (YYYY-MM-DD strings)
+        engine = BacktestEngine(client, strategy, mode="daily",
+                                start_date="2025-01-01", end_date="2025-06-30")
+        engine = BacktestEngine(client, strategy, mode="intraday",
+                                start_date="2026-02-17", end_date="2026-02-28")
+
+        results = engine.run()   # dict[symbol → BacktestResult]
     """
 
-    def __init__(self, client, strategy,
-                 settings_path: str = "settings.json",
-                 mode: str = "daily"):
+    def __init__(
+        self,
+        client,
+        strategy,
+        settings_path: str = "settings.json",
+        mode: str = "daily",
+        start_date: Optional[str] = None,
+        end_date:   Optional[str] = None,
+    ):
         if mode not in MODES:
             raise ValueError(f"mode must be one of {list(MODES)}; got '{mode}'")
-        self.client   = client
-        self.strategy = strategy
-        self.mode     = mode
-        self._cfg     = MODES[mode]
+        self.client     = client
+        self.strategy   = strategy
+        self.mode       = mode
+        self._cfg       = MODES[mode]
+        self.start_date = start_date   # "YYYY-MM-DD" or None
+        self.end_date   = end_date     # "YYYY-MM-DD" or None
         cfg = load_settings(settings_path).global_settings
-        self.profit_target_pct = cfg.profit_target_pct   # e.g. 0.02
-        self.stop_loss_pct     = cfg.stop_loss_pct       # e.g. 0.01
+        self.profit_target_pct = cfg.profit_target_pct
+        self.stop_loss_pct     = cfg.stop_loss_pct
 
     # ── Data fetching ─────────────────────────────────────────────────────────
 
     def fetch_history(self, symbol: str) -> pd.DataFrame:
         """
-        Fetch OHLCV candles from Schwab using the current mode's parameters.
-        Returns a DataFrame sorted oldest → newest with columns:
-          date, open, high, low, close, volume
+        Fetch OHLCV candles from Schwab.
+
+        - No dates:  uses mode's period_type + period (standard window).
+        - With dates: uses start_date/end_date in ms; omits period so Schwab
+          returns all bars within that range at the mode's frequency.
         """
-        raw = self.client.get_price_history(
-            symbol=symbol,
-            period_type=self._cfg["period_type"],
-            period=self._cfg["period"],
-            frequency_type=self._cfg["frequency_type"],
-            frequency=self._cfg["frequency"],
-        )
+        cfg = self._cfg
+        kwargs: dict = {
+            "symbol":        symbol,
+            "period_type":   cfg["period_type"],
+            "frequency_type": cfg["frequency_type"],
+            "frequency":     cfg["frequency"],
+        }
+
+        using_dates = self.start_date and self.end_date
+        if using_dates:
+            kwargs["start_date"] = _to_epoch_ms(self.start_date)
+            kwargs["end_date"]   = _to_epoch_ms(self.end_date)
+            # period is intentionally omitted — dates take precedence
+        else:
+            kwargs["period"] = cfg["period"]
+
+        raw = self.client.get_price_history(**kwargs)
         candles = raw.get("candles", [])
         if not candles:
             raise ValueError(f"No candles returned for {symbol}")
@@ -159,26 +198,31 @@ class BacktestEngine:
                 "volume": int(c.get("volume", 0)),
             })
 
-        df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
-        fmt = self._cfg["date_fmt"]
+        df  = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+        fmt = cfg["date_fmt"]
+
+        if using_dates:
+            range_str = f"{self.start_date} → {self.end_date}"
+        else:
+            range_str = cfg["label"]
+
         logger.info(
             "[BACKTEST] {} — {} bars  ({})  {} → {}",
-            symbol, len(df), self._cfg["label"],
+            symbol, len(df), range_str,
             df["date"].iloc[0].strftime(fmt),
             df["date"].iloc[-1].strftime(fmt),
         )
-        return df
+        return df, range_str
 
     # ── Single-symbol backtest ────────────────────────────────────────────────
 
     def run_symbol(self, symbol: str, size: int) -> BacktestResult:
-        """
-        Walk forward through every bar, evaluate strategy, simulate fills.
-        Returns a BacktestResult with the full trade list and equity curve.
-        """
-        df     = self.fetch_history(symbol)
+        df, range_str = self.fetch_history(symbol)
         closes = df["close"]
-        result = BacktestResult(symbol=symbol, mode=self.mode, n_bars=len(df))
+        result = BacktestResult(
+            symbol=symbol, mode=self.mode,
+            date_range=range_str, n_bars=len(df),
+        )
 
         open_trade: Optional[Trade] = None
         cumulative_pnl = 0.0
@@ -189,38 +233,31 @@ class BacktestEngine:
 
             bar = df.iloc[i]
 
-            # ── Intra-bar risk checks on open position ────────────────────────
+            # ── Intra-bar risk checks ─────────────────────────────────────────
             if open_trade is not None:
                 pnl_pct_high = (bar["high"] - open_trade.entry_price) / open_trade.entry_price
                 pnl_pct_low  = (bar["low"]  - open_trade.entry_price) / open_trade.entry_price
 
-                # Stop-loss — filled at exact stop price (not bar low)
                 if pnl_pct_low <= -self.stop_loss_pct:
                     exit_price = round(open_trade.entry_price * (1 - self.stop_loss_pct), 4)
-                    open_trade = self._close(
-                        open_trade, i, exit_price, bar["date"], "stop-loss"
-                    )
+                    open_trade = self._close(open_trade, i, exit_price, bar["date"], "stop-loss")
                     cumulative_pnl += open_trade.pnl
                     result.trades.append(open_trade)
                     open_trade = None
                     continue
 
-                # Profit target — filled at exact target price (not bar high)
                 elif pnl_pct_high >= self.profit_target_pct:
                     exit_price = round(open_trade.entry_price * (1 + self.profit_target_pct), 4)
-                    open_trade = self._close(
-                        open_trade, i, exit_price, bar["date"], "profit-target"
-                    )
+                    open_trade = self._close(open_trade, i, exit_price, bar["date"], "profit-target")
                     cumulative_pnl += open_trade.pnl
                     result.trades.append(open_trade)
                     open_trade = None
                     continue
 
-            # ── Strategy signal on prices up to and including bar i ───────────
+            # ── Strategy signal ───────────────────────────────────────────────
             prices_so_far = closes.iloc[: i + 1]
             signal = self.strategy.evaluate(prices_so_far, symbol="")
 
-            # Need a next bar to fill on
             if i + 1 >= len(df):
                 break
 
@@ -229,30 +266,21 @@ class BacktestEngine:
 
             if signal == "BUY" and open_trade is None:
                 open_trade = Trade(
-                    symbol=symbol,
-                    size=size,
-                    entry_bar=i + 1,
-                    entry_price=next_open,
-                    entry_date=next_date,
+                    symbol=symbol, size=size,
+                    entry_bar=i + 1, entry_price=next_open, entry_date=next_date,
                 )
-                logger.debug(
-                    "[BACKTEST] {} BUY  bar={} @ {:.4f}  ({})",
-                    symbol, i + 1, next_open,
-                    next_date.strftime(fmt),
-                )
+                logger.debug("[BACKTEST] {} BUY  bar={} @ {:.4f}  ({})",
+                             symbol, i + 1, next_open, next_date.strftime(fmt))
 
             elif signal == "SELL" and open_trade is not None:
                 open_trade = self._close(open_trade, i + 1, next_open, next_date, "signal")
                 cumulative_pnl += open_trade.pnl
                 result.trades.append(open_trade)
-                logger.debug(
-                    "[BACKTEST] {} SELL bar={} @ {:.4f}  pnl={:+.2f}  ({})",
-                    symbol, i + 1, next_open, open_trade.pnl,
-                    next_date.strftime(fmt),
-                )
+                logger.debug("[BACKTEST] {} SELL bar={} @ {:.4f}  pnl={:+.2f}  ({})",
+                             symbol, i + 1, next_open, open_trade.pnl, next_date.strftime(fmt))
                 open_trade = None
 
-        # Force-close any position still open at last bar's close
+        # Force-close any position still open at last bar
         if open_trade is not None:
             last = df.iloc[-1]
             open_trade = self._close(
@@ -262,22 +290,18 @@ class BacktestEngine:
             cumulative_pnl += open_trade.pnl
             result.trades.append(open_trade)
 
-        logger.info(
-            "[BACKTEST] {} complete — {} trade(s)  total_pnl={:+.2f}",
-            symbol, len(result.trades), cumulative_pnl,
-        )
+        logger.info("[BACKTEST] {} complete — {} trade(s)  total_pnl={:+.2f}",
+                    symbol, len(result.trades), cumulative_pnl)
         return result
 
     # ── Multi-symbol runner ───────────────────────────────────────────────────
 
     def run(self) -> dict[str, BacktestResult]:
-        """
-        Run backtest for every symbol in strategy.symbols.
-        Returns dict[symbol → BacktestResult].
-        """
         results = {}
         for symbol, size in self.strategy.symbols.items():
-            logger.info("[BACKTEST] Starting {} (size={})  mode={}", symbol, size, self.mode)
+            logger.info("[BACKTEST] Starting {}  mode={}  dates={}",
+                        symbol, self.mode,
+                        f"{self.start_date}→{self.end_date}" if self.start_date else "default")
             try:
                 results[symbol] = self.run_symbol(symbol, size)
             except Exception as exc:

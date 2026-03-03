@@ -67,8 +67,11 @@ def print_report(symbol: str, result: BacktestResult) -> dict:
     # Column widths differ: intraday dates are 16 chars, daily are 10
     date_w = 16 if intraday else 12
 
+    # Header: prefer explicit date range when set, else mode label
+    data_desc = result.date_range if result.date_range else mode_label
+
     print(f"\n{'=' * 68}")
-    print(f"  BACKTEST REPORT — {symbol}  ({result.n_bars} bars, {mode_label})")
+    print(f"  BACKTEST REPORT — {symbol}  ({result.n_bars} bars, {data_desc})")
     print(f"{'=' * 68}")
 
     if n == 0:
