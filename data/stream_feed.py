@@ -11,11 +11,14 @@ Usage:
 """
 
 import asyncio
+import ssl
 from collections import deque
 from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 
+import certifi
 import pandas as pd
+import websockets
 from loguru import logger
 
 from schwab.streaming import SchwabStreamer, ChartEquityFields, LevelOneEquityFields
@@ -23,6 +26,29 @@ from utils.trade_logger import log_kill_switch
 
 ET = ZoneInfo("America/New_York")
 EOD_FLATTEN_TIME = dt_time(15, 30)
+
+
+class SSLSchwabStreamer(SchwabStreamer):
+    """
+    SchwabStreamer with a certifi SSL context.
+
+    The base library calls ``websockets.connect(url)`` without an SSL context,
+    which fails on macOS Python 3.14 when the server chain contains a
+    self-signed intermediate certificate.  This subclass overrides ``connect()``
+    to inject ``ssl=certifi_ctx`` so the handshake succeeds.
+    """
+
+    async def connect(self) -> None:
+        if self.is_connected:
+            return
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        self.websocket = await websockets.connect(
+            self.streamer_info.streamer_socket_url, ssl=ssl_ctx
+        )
+        await self._login()
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self._receive_task = asyncio.create_task(self._receive_loop())
+        self.is_connected = True
 
 
 class StreamFeed:

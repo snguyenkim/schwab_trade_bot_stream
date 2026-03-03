@@ -31,14 +31,14 @@ from utils.trade_logger import log_kill_switch
 from auth.schwab_auth import get_client
 from config.settings_loader import load_settings
 from data.market_data import MarketData
-from data.stream_feed import StreamFeed
+from data.stream_feed import StreamFeed, SSLSchwabStreamer
 from strategy.ema_crossover import EMACrossoverStrategy
 from strategy.ema3_crossover import EMA3CrossoverStrategy
 from risk.risk_manager import RiskManager
 from execution.order_manager import OrderManager
 from portfolio.position_monitor import PositionMonitor
 
-from schwab.streaming import SchwabStreamer, QOSLevel
+from schwab.streaming import QOSLevel
 
 STRATEGY_CLASSES = {
     "Scalper_EMA2": EMACrossoverStrategy,
@@ -123,7 +123,7 @@ async def run_bot() -> None:
         logger.critical("[MAIN] No streamer_info returned from user preferences")
         sys.exit(1)
 
-    streamer = SchwabStreamer(client.auth, user_prefs.streamer_info[0])
+    streamer = SSLSchwabStreamer(client.auth, user_prefs.streamer_info[0])
 
     # ── StreamFeed — wires streamer → strategy → orders ────────────────────────
     feed = StreamFeed(
