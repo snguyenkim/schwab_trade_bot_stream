@@ -82,6 +82,11 @@ class StreamFeed:
             sym: deque(maxlen=max_bars) for sym in strategy.symbols
         }
 
+        # CHART_EQUITY always delivers 1-min bars. Count them per symbol so we
+        # only append to the buffer and evaluate the strategy on every Nth bar,
+        # where N = strategy.frequency (e.g. 5 → evaluate on each 5-min close).
+        self._bar_counts: dict[str, int] = {sym: 0 for sym in strategy.symbols}
+
         # Shared with PositionMonitor — updated on every Level 1 tick
         self.latest_prices: dict[str, float] = {}
 
@@ -111,8 +116,18 @@ class StreamFeed:
     # ── Streaming callbacks (synchronous — called by SchwabStreamer) ───────────
 
     def _on_chart_bar(self, service: str, content: list) -> None:
-        """Handle CHART_EQUITY data: append new bar close, evaluate strategy."""
+        """
+        Handle CHART_EQUITY data (always 1-min bars from Schwab).
+
+        Schwab's CHART_EQUITY service only emits 1-minute candles regardless of
+        the strategy's configured frequency.  We count incoming bars per symbol
+        and only append to the price buffer + evaluate the strategy on every
+        ``strategy.frequency``-th bar, keeping the buffer in the same timeframe
+        as the historical seed data.
+        """
         close_field = str(ChartEquityFields.CLOSE_PRICE.value)
+        time_field  = str(ChartEquityFields.CHART_TIME.value)
+        freq = self.strategy.frequency  # e.g. 5 for 5-min bars
 
         for item in content:
             symbol = item.get("key", "")
@@ -121,19 +136,37 @@ class StreamFeed:
                 continue
 
             close = float(close_raw)
-            self._price_buffers[symbol].append(close)
+
+            # Always update the live price cache for PositionMonitor
             self.latest_prices[symbol] = close
 
-            bar_time = item.get(str(ChartEquityFields.CHART_TIME.value))
+            # Count every 1-min bar received for this symbol
+            self._bar_counts[symbol] = self._bar_counts.get(symbol, 0) + 1
+            count = self._bar_counts[symbol]
+
+            bar_time = item.get(time_field)
             ts = (
                 datetime.fromtimestamp(bar_time / 1000, tz=ET).strftime("%H:%M")
                 if bar_time else "?"
             )
-            logger.debug("[STREAM] BAR {} @ {} close={:.4f}", symbol, ts, close)
+            logger.debug(
+                "[STREAM] 1-min BAR {} @ {} close={:.4f} (count={}, freq={})",
+                symbol, ts, close, count, freq,
+            )
+
+            # Only act on every Nth 1-min bar (= one complete N-min candle)
+            if count % freq != 0:
+                continue
+
+            self._price_buffers[symbol].append(close)
+            logger.debug(
+                "[STREAM] {}-min BAR {} close={:.4f} → buffer size={}",
+                freq, symbol, close, len(self._price_buffers[symbol]),
+            )
 
             # EOD guard — stop processing new signals after flatten time
             if datetime.now(ET).time() >= EOD_FLATTEN_TIME:
-                logger.info("[STREAM] Past EOD flatten time, ignoring bar for {}", symbol)
+                logger.info("[STREAM] Past EOD flatten time, skipping signal for {}", symbol)
                 continue
 
             self._process_signal(symbol)
