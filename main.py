@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-main.py — Day Trading Bot entry point.
+main.py — Day Trading Bot entry point (streaming edition).
 
-Starts the Scalper_EMA2 agent loop:
+Flow:
   1. Authenticate via CredentialManager (SQLite)
   2. Load strategy + settings
-  3. Spin up position monitor in background thread
-  4. Loop: fetch prices → evaluate signal → risk check → execute order
+  3. Fetch user preferences → get StreamerInfo
+  4. Spin up PositionMonitor in a background daemon thread
+  5. Connect SchwabStreamer WebSocket
+  6. StreamFeed seeds historical buffers, then drives strategy evaluation
+     on every new CHART_EQUITY bar — no more polling loop
 """
 
+import asyncio
 import os
 import signal
 import sys
-import time
 import threading
 from datetime import datetime, time as dt_time
 from pathlib import Path
@@ -22,45 +25,49 @@ from loguru import logger
 
 PID_FILE = Path("bot.pid")
 
-# ── Project imports ────────────────────────────────────────────────────────────
+# ── Project imports ─────────────────────────────────────────────────────────
 from utils.logger import setup_logger
 from utils.trade_logger import log_kill_switch
 from auth.schwab_auth import get_client
 from config.settings_loader import load_settings
 from data.market_data import MarketData
+from data.stream_feed import StreamFeed
 from strategy.ema_crossover import EMACrossoverStrategy
 from strategy.ema3_crossover import EMA3CrossoverStrategy
 from risk.risk_manager import RiskManager
+from execution.order_manager import OrderManager
+from portfolio.position_monitor import PositionMonitor
+
+from schwab.streaming import SchwabStreamer, QOSLevel
 
 STRATEGY_CLASSES = {
     "Scalper_EMA2": EMACrossoverStrategy,
     "Scalper_EMA3": EMA3CrossoverStrategy,
 }
-from execution.order_manager import OrderManager
-from portfolio.position_monitor import PositionMonitor
 
 ET = ZoneInfo("America/New_York")
-MARKET_OPEN = dt_time(10, 0)
+MARKET_OPEN  = dt_time(10, 0)
 MARKET_CLOSE = dt_time(16, 0)
+EOD_FLATTEN_TIME = dt_time(15, 30)
 
 
 def market_is_open() -> bool:
     now = datetime.now(ET)
-    if now.weekday() >= 5:          # Saturday / Sunday
+    if now.weekday() >= 5:
         return False
     return MARKET_OPEN <= now.time() < MARKET_CLOSE
 
 
-def main():
-    # ── Settings — load first so strategy name is available for logging ─────────
+async def run_bot() -> None:
+    # ── Settings ───────────────────────────────────────────────────────────────
     settings = load_settings("settings.json")
     strategy_name = settings.global_settings.strategy
 
     # ── Logging ────────────────────────────────────────────────────────────────
     setup_logger(log_dir="logs", strategy_name=strategy_name)
-    logger.info("[MAIN] Starting {} bot", strategy_name)
+    logger.info("[MAIN] Starting {} bot (streaming mode)", strategy_name)
 
-    # ── PID file — lets force_flatten.py find this process ─────────────────────
+    # ── PID file ───────────────────────────────────────────────────────────────
     PID_FILE.write_text(str(os.getpid()))
     logger.info("[MAIN] PID {} written to {}", os.getpid(), PID_FILE)
 
@@ -79,7 +86,7 @@ def main():
     account_hash = account_numbers.accounts[0].hash_value
     logger.info("[MAIN] Trading account hash: {}", account_hash)
 
-    # ── Strategy — resolve class from name in settings.json ────────────────────
+    # ── Strategy ───────────────────────────────────────────────────────────────
     if strategy_name not in STRATEGY_CLASSES:
         logger.critical(
             "[MAIN] Unknown strategy '{}'. Available: {}",
@@ -104,10 +111,34 @@ def main():
     )
 
     # ── Sub-components ─────────────────────────────────────────────────────────
-    market_data = MarketData(client)
+    market_data  = MarketData(client)
     risk_manager = RiskManager(settings_path="settings.json")
     order_manager = OrderManager(client, account_hash)
     monitor = PositionMonitor(client, order_manager, settings_path="settings.json")
+
+    # ── Streamer setup ─────────────────────────────────────────────────────────
+    logger.info("[MAIN] Fetching user preferences for streaming...")
+    user_prefs = client.get_user_preferences()
+    if not user_prefs.streamer_info:
+        logger.critical("[MAIN] No streamer_info returned from user preferences")
+        sys.exit(1)
+
+    streamer = SchwabStreamer(client.auth, user_prefs.streamer_info[0])
+
+    # ── StreamFeed — wires streamer → strategy → orders ────────────────────────
+    feed = StreamFeed(
+        streamer=streamer,
+        market_data=market_data,
+        strategy=strategy,
+        risk_manager=risk_manager,
+        order_manager=order_manager,
+        monitor=monitor,
+        settings=settings,
+    )
+
+    # Share the live price cache with PositionMonitor so it reads
+    # streamed prices instead of polling the REST endpoint
+    monitor._price_cache = feed.latest_prices
 
     # ── SIGUSR1 handler — force EOD flatten from outside the process ───────────
     def _handle_sigusr1(signum, frame):
@@ -115,9 +146,9 @@ def main():
         monitor._flatten_all("manual force-flatten via SIGUSR1")
 
     signal.signal(signal.SIGUSR1, _handle_sigusr1)
-    logger.info("[MAIN] SIGUSR1 handler registered (send to PID {} to force-flatten)", os.getpid())
+    logger.info("[MAIN] SIGUSR1 handler registered (PID {})", os.getpid())
 
-    # ── Position monitor — background daemon thread ────────────────────────────
+    # ── PositionMonitor — background daemon thread ─────────────────────────────
     monitor_thread = threading.Thread(
         target=monitor.run,
         kwargs={"poll_interval_sec": 5},
@@ -127,65 +158,26 @@ def main():
     monitor_thread.start()
     logger.info("[MAIN] Position monitor started (daemon thread)")
 
-    # ── Main agent loop ────────────────────────────────────────────────────────
-    tick_interval = strategy.frequency * 60   # convert minutes → seconds
-
+    # ── Wait for market open ───────────────────────────────────────────────────
     logger.info("[MAIN] Waiting for market to open...")
     while not market_is_open():
-        time.sleep(30)
+        await asyncio.sleep(30)
 
-    logger.info("[MAIN] Market open — entering signal loop")
+    logger.info("[MAIN] Market open — connecting streamer")
 
+    # ── Connect WebSocket ──────────────────────────────────────────────────────
+    await streamer.connect()
+    await streamer.set_qos(QOSLevel.FAST)
+    logger.info("[MAIN] Streamer connected")
+
+    # ── Run until market close, kill switch, or Ctrl+C ────────────────────────
     try:
-        while market_is_open():
-            for symbol, size in strategy.symbols.items():
-                try:
-                    prices = market_data.get_price_series(
-                        symbol,
-                        period_type=strategy.period_type,
-                        period=strategy.period,
-                        frequency_type=strategy.frequency_type,
-                        frequency=strategy.frequency,
-                    )
-
-                    if prices.empty:
-                        continue
-
-                    trade_signal = strategy.evaluate(prices, symbol=symbol)
-
-                    if trade_signal == "BUY":
-                        if risk_manager.approve(symbol, "BUY", size):
-                            fill = order_manager.execute(symbol, "BUY", quantity=size)
-                            if fill > 0:
-                                monitor.add_position(symbol, size, fill)
-                                risk_manager.record_fill(symbol, "BUY", size, fill)
-
-                    elif trade_signal == "SELL":
-                        if risk_manager.approve(symbol, "SELL", size):
-                            fill = order_manager.execute(symbol, "SELL", quantity=size)
-                            if fill > 0:
-                                entry = order_manager.entry_price(symbol)
-                                risk_manager.record_fill(
-                                    symbol, "SELL", size, fill, entry
-                                )
-                                monitor.remove_position(symbol)
-
-                except Exception as exc:
-                    logger.error(
-                        "[MAIN] Error processing {symbol}: {exc}",
-                        symbol=symbol, exc=exc,
-                    )
-
-            # Daily loss kill switch check
-            if risk_manager.daily_pnl <= -abs(settings.global_settings.max_daily_loss_usd):
-                log_kill_switch("daily loss limit breached", risk_manager.daily_pnl)
-                logger.critical("[MAIN] Kill switch activated — halting bot")
-                break
-
-            time.sleep(tick_interval)
-
-    except KeyboardInterrupt:
-        logger.info("[MAIN] Interrupted by user — initiating EOD cleanup")
+        await feed.run()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        logger.info("[MAIN] Disconnecting streamer...")
+        await streamer.disconnect()
 
     # ── EOD cleanup ────────────────────────────────────────────────────────────
     PID_FILE.unlink(missing_ok=True)
@@ -193,6 +185,13 @@ def main():
         "[MAIN] Session complete | realized_pnl={pnl:+.2f}",
         pnl=risk_manager.daily_pnl,
     )
+
+
+def main() -> None:
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        logger.info("[MAIN] Interrupted by user — shutting down")
 
 
 if __name__ == "__main__":

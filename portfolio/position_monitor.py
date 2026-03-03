@@ -23,9 +23,14 @@ class PositionMonitor:
     Background monitor for all open positions.
     Checks stop-loss, profit-target, trailing-stop, time-stop,
     EOD flatten, and the daily loss kill switch.
+
+    When a StreamFeed is active, pass its ``latest_prices`` dict as
+    ``price_cache`` so the monitor reads streamed prices instead of
+    polling the REST quotes endpoint on every tick.
     """
 
-    def __init__(self, client, order_manager, settings_path: str = "settings.json"):
+    def __init__(self, client, order_manager, settings_path: str = "settings.json",
+                 price_cache: dict | None = None):
         cfg = load_settings(settings_path)
         g = cfg.global_settings
 
@@ -39,6 +44,8 @@ class PositionMonitor:
 
         self.positions: dict[str, Position] = {}
         self.realized_pnl: float = 0.0
+        # Optional shared dict populated by StreamFeed._on_level1_quote
+        self._price_cache: dict[str, float] = price_cache if price_cache is not None else {}
 
     # ── Position registry ──────────────────────────────────────────────────────
 
@@ -164,6 +171,10 @@ class PositionMonitor:
             self._close_position(pos, price, reason)
 
     def _get_price(self, symbol: str) -> float:
+        # Use streamed price if available (populated by StreamFeed)
+        if symbol in self._price_cache:
+            return self._price_cache[symbol]
+        # Fall back to REST quote when streaming is not active
         response = self.client.get_quotes(symbol)
         obj = response.root.get(symbol)
         if obj is None:
