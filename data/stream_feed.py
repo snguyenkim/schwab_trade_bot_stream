@@ -93,6 +93,29 @@ class SSLSchwabStreamer(SchwabStreamer):
                         code, msg,
                     )
 
+    # ── Raw message logger (overrides silent base implementation) ────────────
+
+    async def _receive_loop(self) -> None:
+        """Receive WebSocket frames, log every raw message, then dispatch."""
+        while self.websocket:
+            try:
+                raw = await self.websocket.recv()
+                logger.info("[STREAM] RAW ← {}", raw[:500])   # first 500 chars
+                import json as _json
+                data = _json.loads(raw)
+                if "response" in data:
+                    await self._handle_response(data["response"])
+                elif "data" in data:
+                    await self._handle_data(data["data"])
+                elif "notify" in data:
+                    await self._handle_notify(data["notify"])
+            except websockets.exceptions.ConnectionClosed:
+                logger.warning("[STREAM] WebSocket connection closed")
+                self.is_connected = False
+                break
+            except Exception as exc:
+                logger.error("[STREAM] Receive error: {}", exc)
+
     # ── SSL connect + wait for login confirmation ─────────────────────────────
 
     async def connect(self) -> None:
@@ -102,16 +125,17 @@ class SSLSchwabStreamer(SchwabStreamer):
         self.websocket = await websockets.connect(
             self.streamer_info.streamer_socket_url, ssl=ssl_ctx
         )
-        # Start receiving BEFORE sending login so the response is captured
-        self._receive_task  = asyncio.create_task(self._receive_loop())
+        # Set is_connected=True BEFORE starting tasks so _receive_loop
+        # doesn't exit immediately (the base loop checks self.is_connected)
+        self.is_connected = True
+        self._receive_task   = asyncio.create_task(self._receive_loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         await self._login()
-        # Block until the server confirms LOGIN (or timeout after 10 s)
+        # Yield to event loop so _receive_task can process the login response
         try:
             await asyncio.wait_for(self._login_event.wait(), timeout=10.0)
         except asyncio.TimeoutError:
             logger.warning("[STREAM] Login confirmation timed out — proceeding anyway")
-        self.is_connected = True
 
 
 class StreamFeed:
@@ -212,7 +236,7 @@ class StreamFeed:
                 datetime.fromtimestamp(bar_time / 1000, tz=ET).strftime("%H:%M")
                 if bar_time else "?"
             )
-            logger.debug(
+            logger.info(
                 "[STREAM] 1-min BAR {} @ {} close={:.4f} (count={}, freq={})",
                 symbol, ts, close, count, freq,
             )
@@ -222,7 +246,7 @@ class StreamFeed:
                 continue
 
             self._price_buffers[symbol].append(close)
-            logger.debug(
+            logger.info(
                 "[STREAM] {}-min BAR {} close={:.4f} → buffer size={}",
                 freq, symbol, close, len(self._price_buffers[symbol]),
             )
@@ -266,6 +290,8 @@ class StreamFeed:
         except Exception as exc:
             logger.error("[STREAM] Strategy error for {}: {}", symbol, exc)
             return
+
+        logger.info("[STREAM] SIGNAL {} → {} (buf={})", symbol, signal, len(prices))
 
         if signal == "BUY":
             if self.risk_manager.approve(symbol, "BUY", size):
