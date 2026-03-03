@@ -1525,3 +1525,100 @@ git commit -m "Add Scalper_EMA3 strategy with triple EMA crossover"
 | `.env` | **No** | Secrets |
 
 Both methods are safe to call at any time — they log errors and return `[]` on failure so the bot loop is never interrupted.
+
+---
+
+## 📊 Backtesting
+
+### Overview
+Runs any configured strategy against **1 year of daily OHLCV candles** fetched directly from the Schwab API — no extra libraries needed.
+
+### Run a backtest
+
+```bash
+# Uses strategy set in settings.json global_settings.strategy
+python scripts/run_backtest.py
+
+# Override strategy explicitly
+python scripts/run_backtest.py --strategy Scalper_EMA2
+python scripts/run_backtest.py --strategy Scalper_EMA3
+```
+
+### Data source
+```python
+client.get_price_history(
+    symbol=symbol,
+    period_type="year",
+    period=1,
+    frequency_type="daily",
+    frequency=1,
+)
+# → ~252 daily OHLCV candles per symbol
+```
+
+### Fill model (no look-ahead bias)
+- Signals are evaluated at the **close of bar `i`**
+- Orders are filled at the **open of bar `i+1`**
+- Intra-bar risk checks use the bar's `high` / `low` to detect stop-loss / profit-target hits
+
+### Exit rules (same as live bot)
+| Rule | Trigger |
+|------|---------|
+| Stop-loss | Bar low implies `pnl_pct <= -stop_loss_pct` → filled at stop price |
+| Profit target | Bar high implies `pnl_pct >= profit_target_pct` → filled at target price |
+| Signal exit | Strategy emits SELL → filled at next bar's open |
+| End-of-backtest | Any open position closed at last bar's close |
+
+Risk thresholds come from `settings.json → global_settings.stop_loss_pct` and `profit_target_pct`.
+
+### Performance metrics reported
+| Metric | Description |
+|--------|-------------|
+| Total P&L | Sum of all realised P&L in dollars |
+| Win rate | % of trades with positive P&L |
+| Avg win / loss | Average dollar gain/loss per trade |
+| Profit factor | Gross wins ÷ gross losses |
+| Sharpe ratio | Annualised (√252), computed from per-trade return series |
+| Max drawdown | Largest peak-to-trough decline in cumulative P&L |
+| Avg hold days | Average calendar days per trade |
+| Exit breakdown | Count of trades by exit reason |
+
+### Sample output
+```
+==============================================================
+  BACKTEST REPORT — AAPL  (252 daily bars, 1 year)
+==============================================================
+  Total trades    : 8
+  Win / Loss      : 5W  3L  (62.5% win rate)
+  Total P&L       : $+1,240.00
+  Avg win         :  $+430.00
+  Avg loss        :  $-178.33
+  Profit factor   : 4.03
+  Sharpe ratio    : 1.84  (annualised)
+  Max drawdown    : $245.00
+  Avg hold (days) : 12.3
+  Exit breakdown  : {'signal': 5, 'stop-loss': 2, 'profit-target': 1}
+──────────────────────────────────────────────────────────────
+  Entry date   Exit date    Entry     Exit       P&L  Reason
+  ──────────────────────────────────────────────────────────
+  2025-03-15   2025-03-28  182.3500  185.8900  $+358.00  signal
+  ...
+==============================================================
+```
+
+### File structure
+```
+backtest/
+├── __init__.py
+├── engine.py          # BacktestEngine — fetch data, replay bars, simulate fills
+└── report.py          # print_report(), print_summary() — stats + trade log
+
+scripts/
+└── run_backtest.py    # CLI entry point
+```
+
+### Limitations
+- **Daily bars only** — 1-minute intra-day data is limited to 10 days max by Schwab API; daily bars give ~252 data points for a full year.
+- **Long-only** — the bot only holds long positions; short-selling is not modelled.
+- **Single position per symbol** — matches the live bot's one-position-at-a-time constraint.
+- **No slippage or commission model** — fills at exact open/stop/target prices.
