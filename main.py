@@ -151,16 +151,16 @@ def main():
                     if prices.empty:
                         continue
 
-                    signal = strategy.evaluate(prices, symbol=symbol)
+                    trade_signal = strategy.evaluate(prices, symbol=symbol)
 
-                    if signal == "BUY":
+                    if trade_signal == "BUY":
                         if risk_manager.approve(symbol, "BUY", size):
                             fill = order_manager.execute(symbol, "BUY", quantity=size)
                             if fill > 0:
                                 monitor.add_position(symbol, size, fill)
                                 risk_manager.record_fill(symbol, "BUY", size, fill)
 
-                    elif signal == "SELL":
+                    elif trade_signal == "SELL":
                         if risk_manager.approve(symbol, "SELL", size):
                             fill = order_manager.execute(symbol, "SELL", quantity=size)
                             if fill > 0:
