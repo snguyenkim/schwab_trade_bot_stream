@@ -1,10 +1,12 @@
+import json
 import sys
 import time
 from datetime import datetime, time as dt_time
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from loguru import logger
 
-sys.path.insert(0, str(Path := __import__("pathlib").Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from config.settings_loader import load_settings
 from portfolio.position import Position
 from utils.trade_logger import (
@@ -13,6 +15,7 @@ from utils.trade_logger import (
 
 ET = ZoneInfo("America/New_York")
 EOD_FLATTEN_TIME = dt_time(15, 30)
+STATE_FILE = Path("state/positions.json")
 
 
 class PositionMonitor:
@@ -47,9 +50,11 @@ class PositionMonitor:
             "[MONITOR] TRACKING | {symbol} size={size} entry={entry:.4f}",
             symbol=symbol, size=size, entry=entry_price,
         )
+        self._save_state()
 
     def remove_position(self, symbol: str) -> None:
         self.positions.pop(symbol, None)
+        self._save_state()
 
     # ── Main loop ──────────────────────────────────────────────────────────────
 
@@ -68,6 +73,7 @@ class PositionMonitor:
                 break
 
             self._check_all_positions(now_et)
+            self._save_state()
 
             if self.realized_pnl <= -abs(self.max_daily_loss):
                 self._flatten_all("daily loss limit breached")
@@ -168,6 +174,26 @@ class PositionMonitor:
             price = (quote.get("lastPrice") or quote.get("last")
                      or quote.get("mark"))
         return float(price)
+
+    def _save_state(self) -> None:
+        """Write open positions to state/positions.json for force_flatten.py."""
+        try:
+            STATE_FILE.parent.mkdir(exist_ok=True)
+            data = {
+                "updated_at": datetime.now(ET).isoformat(),
+                "positions": [
+                    {
+                        "symbol": pos.symbol,
+                        "size": pos.size,
+                        "entry_price": pos.entry_price,
+                        "entry_time": pos.entry_time.isoformat(),
+                    }
+                    for pos in self.positions.values()
+                ],
+            }
+            STATE_FILE.write_text(json.dumps(data, indent=2))
+        except Exception as exc:
+            logger.warning("[MONITOR] Failed to write state file: {}", exc)
 
     # ── Status ─────────────────────────────────────────────────────────────────
 

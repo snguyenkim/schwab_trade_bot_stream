@@ -22,6 +22,7 @@ class GlobalSettings:
     stop_loss_pct: float
     max_daily_loss_usd: float = 500.0
     max_hold_minutes: int = 60
+    strategy: str = "Scalper_EMA2"
 
     def get(self, key: str, default=None):
         return getattr(self, key, default)
@@ -42,6 +43,7 @@ def load_settings(path: str = "settings.json") -> AppSettings:
         stop_loss_pct=g["stop_loss_pct"],
         max_daily_loss_usd=g.get("max_daily_loss_usd", 500.0),
         max_hold_minutes=g.get("max_hold_minutes", 60),
+        strategy=g.get("strategy", "Scalper_EMA2"),
     )
 
     strategies = {}

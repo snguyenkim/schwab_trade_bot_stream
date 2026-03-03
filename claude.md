@@ -1261,6 +1261,103 @@ day-trading-bot/
 
 ---
 
+## 📈 Triple EMA Crossover Strategy (Scalper_EMA3)
+
+### Concept
+Uses **three Exponential Moving Averages** — fast, medium, and slow. The fast/medium pair generates entry/exit signals; the slow EMA acts as a trend filter so signals are only taken in the prevailing direction.
+
+- **BUY**  → fast EMA crosses **above** medium EMA, AND last close is **above** slow EMA (uptrend confirmed)
+- **SELL** → fast EMA crosses **below** medium EMA, AND last close is **below** slow EMA (downtrend confirmed)
+- **HOLD** → crossover occurs but against the slow EMA direction, or no crossover
+
+### Default Windows (from `settings.json`)
+| EMA | Span | Role |
+|-----|------|------|
+| Fast | 5 | Signal crossover trigger |
+| Medium | 13 | Signal crossover counterpart |
+| Slow | 50 | Trend filter — only trade in its direction |
+
+### `strategy/ema3_crossover.py`
+```python
+class EMA3CrossoverStrategy(BaseStrategy):
+    def __init__(self, strategy_name="Scalper_EMA3", settings_path="settings.json"):
+        cfg = get_strategy(strategy_name, settings_path)
+        p = cfg.parameters
+        self.short_span  = p["short_span"]    # 5
+        self.medium_span = p["medium_span"]   # 13
+        self.long_span   = p["long_span"]     # 50
+        self.frequency   = p.get("frequency", 1)
+        self.symbols     = {sym.name: sym.position_size for sym in cfg.symbols}
+
+    def compute_emas(self, prices):
+        fast   = prices.ewm(span=self.short_span,  adjust=False).mean()
+        medium = prices.ewm(span=self.medium_span, adjust=False).mean()
+        slow   = prices.ewm(span=self.long_span,   adjust=False).mean()
+        return fast, medium, slow
+
+    def evaluate(self, prices, symbol=""):
+        if len(prices) < self.long_span + 1:
+            return "HOLD"
+        fast, medium, slow = self.compute_emas(prices)
+        prev_fast_above = fast.iloc[-2] > medium.iloc[-2]
+        curr_fast_above = fast.iloc[-1] > medium.iloc[-1]
+        in_uptrend   = prices.iloc[-1] > slow.iloc[-1]
+        in_downtrend = prices.iloc[-1] < slow.iloc[-1]
+        if not prev_fast_above and curr_fast_above and in_uptrend:
+            return "BUY"
+        if prev_fast_above and not curr_fast_above and in_downtrend:
+            return "SELL"
+        return "HOLD"
+```
+
+### `settings.json` — Scalper_EMA3 block
+```json
+{
+  "name": "Scalper_EMA3",
+  "parameters": {
+    "short_span": 5,
+    "medium_span": 13,
+    "long_span": 50,
+    "period_type": "day",
+    "period": 2,
+    "frequency_type": "minute",
+    "frequency": 1
+  },
+  "symbols": [
+    { "name": "QQQ",  "position_size": 100 },
+    { "name": "AMZN", "position_size": 100 },
+    { "name": "NVDA", "position_size": 100 }
+  ]
+}
+```
+
+### Logging
+Every bar emits a `TRACE`-level `[BAR3]` line with all three EMA values and the current trend direction:
+```
+[BAR3] QQQ | close=484.2100 | fast=484.0320 | medium=483.7410 | slow=481.9900 | f-m=+0.2910 | trend=UP
+```
+Signals use the same `log_signal()` helper as EMA2 (`[SIGNAL] QQQ → BUY | fast_ema=... | slow_ema=...`), where `slow_ema` refers to the medium EMA (the crossover counterpart).
+
+### Switching between strategies
+Change one line in `settings.json` — **no code changes needed**:
+```json
+"global_settings": {
+  "strategy": "Scalper_EMA2",   ← change to "Scalper_EMA3" to switch
+  ...
+}
+```
+`main.py` reads `global_settings.strategy` at startup, looks up the class in `STRATEGY_CLASSES`, and instantiates it. All other components (risk manager, order manager, position monitor) are strategy-agnostic.
+
+### File Structure
+```
+strategy/
+├── base_strategy.py       # Abstract BaseStrategy interface
+├── ema_crossover.py       # Scalper_EMA2 — dual EMA (short/long)
+└── ema3_crossover.py      # Scalper_EMA3 — triple EMA (short/medium/long)
+```
+
+---
+
 ## 📝 Implementation Changes (vs. Template)
 
 The following changes were made during Phase 1 implementation:
@@ -1287,3 +1384,144 @@ which caused `None` to be returned on freshly created databases.
 
 ### GitHub repository
 [github.com/snguyenkim/schwab_trade_bot](https://github.com/snguyenkim/schwab_trade_bot) (private)
+
+### Strategy selector via `settings.json`
+`global_settings.strategy` controls which strategy `main.py` runs — no code changes needed:
+
+```json
+"global_settings": {
+  "strategy": "Scalper_EMA2"
+}
+```
+
+| Value | Class | File |
+|-------|-------|------|
+| `"Scalper_EMA2"` | `EMACrossoverStrategy` | `strategy/ema_crossover.py` |
+| `"Scalper_EMA3"` | `EMA3CrossoverStrategy` | `strategy/ema3_crossover.py` |
+
+`main.py` resolves the class at startup via `STRATEGY_CLASSES` dict. Unknown names print a clear error and exit. `GlobalSettings.strategy` defaults to `"Scalper_EMA2"` if the key is omitted from `settings.json`.
+
+### Force EOD flatten
+
+Two mechanisms were added to close all positions outside the automatic 15:30 ET trigger:
+
+#### 1. SIGUSR1 signal handler (`main.py`)
+- On startup, `main.py` writes its PID to `bot.pid`
+- A `SIGUSR1` handler is registered that calls `monitor._flatten_all()` immediately
+- `bot.pid` is deleted on clean exit
+- Trigger with: `kill -USR1 $(cat bot.pid)`
+
+#### 2. Standalone emergency script (`scripts/force_flatten.py`)
+Works even when `main.py` is completely hung:
+
+1. **Soft signal** — sends `SIGUSR1`, waits 5s for the bot to exit cleanly
+2. **Force kill** — if still alive, sends `SIGKILL`
+3. **Read state** — loads open positions from `state/positions.json`
+4. **Re-auth** — independently authenticates via `schwab_trader.db`
+5. **Paper-sell** — logs forced SELL for each position with current price + P&L
+6. **Cleanup** — removes `bot.pid` and `state/positions.json`
+
+Run with:
+```bash
+python scripts/force_flatten.py
+```
+
+#### 3. Position state file (`state/positions.json`)
+`PositionMonitor` writes `state/positions.json` on every `add_position`, `remove_position`, and after each 5-second poll cycle. This ensures `force_flatten.py` always has an up-to-date position snapshot even after a crash.
+
+Both `bot.pid` and `state/` are added to `.gitignore`.
+
+### Broker query methods (`OrderManager`)
+
+Two methods added to `execution/order_manager.py` for fetching live data from the Schwab API:
+
+#### `get_open_orders(days_back=1) → list[dict]`
+Calls `client.get_orders(status="WORKING")`. Returns:
+```python
+[{
+    "order_id", "symbol", "instruction",   # BUY / SELL
+    "quantity", "filled", "status",
+    "order_type", "entered_time"
+}]
+```
+
+#### `get_positions() → list[dict]`
+Calls `client.get_account(include_positions=True)`. Filters to `POSITION_ASSET_TYPES`:
+
+| Asset type | Covers |
+|------------|--------|
+| `EQUITY` | Individual stocks |
+| `COLLECTIVE_INVESTMENT` | Mutual funds, ETFs (booked as collective), UITs |
+
+Returns:
+```python
+[{
+    "symbol", "asset_type",
+    "long_qty", "short_qty", "net_qty",
+    "avg_price", "market_value"
+}]
+```
+
+To add more asset types, extend the class-level set in `order_manager.py`:
+```python
+POSITION_ASSET_TYPES = {"EQUITY", "COLLECTIVE_INVESTMENT", "FIXED_INCOME"}
+```
+
+---
+
+## 🗂 Git Workflow
+
+### Repository Setup (one-time)
+
+```bash
+cd /Users/sonnguyen/Desktop/_tradingbot/Agent/Test_1
+git init
+git add .
+git commit -m "Initial commit — day trading bot"
+```
+
+### .gitignore — critical exclusions
+
+The `.gitignore` already covers all sensitive and runtime files:
+
+```
+schwab_trader.db   # OAuth tokens + API credentials — NEVER commit
+bot.pid            # Runtime PID file
+state/             # Live position state written every 5s
+logs/              # Daily rotating log files
+__pycache__/
+*.pyc
+.env
+```
+
+> ⚠️ Always verify `.gitignore` is applied **before** `git add .` — run `git status` and confirm `schwab_trader.db` is not listed.
+
+### Typical commit workflow
+
+```bash
+# Check what changed
+git status
+git diff
+
+# Stage specific files (preferred over git add -A)
+git add settings.json strategy/ema3_crossover.py
+
+# Commit
+git commit -m "Add Scalper_EMA3 strategy with triple EMA crossover"
+```
+
+### What to commit vs. what to exclude
+
+| File / Dir | Commit? | Reason |
+|------------|---------|--------|
+| `*.py` source files | Yes | Core bot logic |
+| `settings.json` | Yes | Strategy config (no secrets) |
+| `CLAUDE.md`, `info.md` | Yes | Project docs |
+| `requirements.txt` | Yes | Reproducible installs |
+| `schwab_trader.db` | **No** | Contains plaintext API keys + OAuth tokens |
+| `bot.pid` | **No** | Runtime artifact |
+| `state/positions.json` | **No** | Runtime artifact |
+| `logs/` | **No** | Large, auto-generated |
+| `.env` | **No** | Secrets |
+
+Both methods are safe to call at any time — they log errors and return `[]` on failure so the bot loop is never interrupted.

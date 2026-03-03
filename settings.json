@@ -1,5 +1,6 @@
 {
   "global_settings": {
+    "strategy": "Scalper_EMA2",
     "profit_target_pct": 0.02,
     "stop_loss_pct": 0.01,
     "max_daily_loss_usd": 500,
@@ -28,6 +29,9 @@
         "short_span": 5,
         "medium_span": 13,
         "long_span": 50,
+        "period_type": "day",
+        "period": 2,
+        "frequency_type": "minute",
         "frequency": 1
       },
       "symbols": [

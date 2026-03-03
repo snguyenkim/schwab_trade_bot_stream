@@ -1,4 +1,5 @@
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from loguru import logger
 
@@ -96,6 +97,93 @@ class OrderManager:
 
     def entry_price(self, symbol: str) -> float:
         return self._entry_prices.get(symbol, 0.0)
+
+    # ── Broker queries ─────────────────────────────────────────────────────────
+
+    def get_open_orders(self, days_back: int = 1) -> list[dict]:
+        """
+        Fetch all working (open/pending) orders from the Schwab API.
+        Returns a list of dicts with order details.
+        """
+        try:
+            raw_orders = self.client.get_orders(
+                account_number=self.account_hash,
+                from_entered_time=datetime.now() - timedelta(days=days_back),
+                to_entered_time=datetime.now(),
+                status="WORKING",
+            )
+            orders = []
+            for o in raw_orders:
+                symbol = ""
+                instruction = ""
+                if getattr(o, "order_leg_collection", None):
+                    leg = o.order_leg_collection[0]
+                    symbol = getattr(getattr(leg, "instrument", None), "symbol", "")
+                    instruction = str(getattr(leg, "instruction", ""))
+                orders.append({
+                    "order_id":    getattr(o, "order_id", ""),
+                    "symbol":      symbol,
+                    "instruction": instruction,
+                    "quantity":    getattr(o, "quantity", 0),
+                    "filled":      getattr(o, "filled_quantity", 0),
+                    "status":      str(getattr(o, "status", "")),
+                    "order_type":  str(getattr(o, "order_type", "")),
+                    "entered_time": str(getattr(o, "entered_time", "")),
+                })
+            logger.info("[ORDER] get_open_orders → {} working order(s)", len(orders))
+            return orders
+        except Exception as exc:
+            logger.error("[ORDER] get_open_orders failed: {}", exc)
+            return []
+
+    # Asset types included by get_positions()
+    POSITION_ASSET_TYPES = {"EQUITY", "COLLECTIVE_INVESTMENT"}
+
+    def get_positions(self) -> list[dict]:
+        """
+        Fetch current positions from the Schwab API.
+        Includes EQUITY and COLLECTIVE_INVESTMENT (mutual funds, ETFs, UITs).
+        Returns a list of dicts with position details, each including 'asset_type'.
+        """
+        try:
+            account = self.client.get_account(
+                self.account_hash, include_positions=True
+            )
+            sec = account.securities_account
+            raw_positions = getattr(sec, "positions", []) or []
+            positions = []
+            for p in raw_positions:
+                inst = getattr(p, "instrument", None)
+                if not inst:
+                    continue
+                asset_type = str(getattr(inst, "asset_type", "")).upper()
+                if asset_type not in self.POSITION_ASSET_TYPES:
+                    continue
+                symbol       = getattr(inst, "symbol", "")
+                long_qty     = float(getattr(p, "long_quantity", 0) or 0)
+                short_qty    = float(getattr(p, "short_quantity", 0) or 0)
+                avg_price    = float(getattr(p, "average_price", 0) or 0)
+                market_value = float(getattr(p, "market_value", 0) or 0)
+                positions.append({
+                    "symbol":       symbol,
+                    "asset_type":   asset_type,
+                    "long_qty":     long_qty,
+                    "short_qty":    short_qty,
+                    "net_qty":      long_qty - short_qty,
+                    "avg_price":    round(avg_price, 4),
+                    "market_value": round(market_value, 2),
+                })
+            by_type = {}
+            for pos in positions:
+                by_type[pos["asset_type"]] = by_type.get(pos["asset_type"], 0) + 1
+            logger.info(
+                "[ORDER] get_positions → {} position(s) {}",
+                len(positions), by_type,
+            )
+            return positions
+        except Exception as exc:
+            logger.error("[ORDER] get_positions failed: {}", exc)
+            return []
 
     def _fetch_price(self, symbol: str) -> float:
         try:

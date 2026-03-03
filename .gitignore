@@ -8,6 +8,10 @@ info.md
 # Claude Code local settings
 .claude/
 
+# Runtime state
+bot.pid
+state/
+
 # Logs
 logs/
 *.log
